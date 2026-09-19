@@ -3,6 +3,11 @@
 #include <vector>
 #include <cstdint>
 #include "eval_dispatch.h"
+#include <chrono> 
+#include <atomic>
+#include <iostream>
+
+using Clock = std::chrono::steady_clock;
 
 enum class TTFlag { EXACT, ALPHA, BETA };
 
@@ -27,6 +32,11 @@ class TranspositionTable {
 
     void clear () {
         std::fill (table.begin (), table.end (), TTEntry{});
+    }
+
+    chess::Move probe_move (uint64_t hash) const {
+        const TTEntry& entry = table[hash % table_size];
+        return entry.hash == hash ? entry.best_move : chess::Move::NO_MOVE;
     }
 
     bool lookup (uint64_t hash, int depth, int alpha, int beta, int& tt_score, chess::Move& tt_move) {
@@ -163,6 +173,7 @@ TranspositionTable TT (1048576);
 chess::Move        killer_moves[64];
 
 int quiescence_search (chess::Board& board, int alpha, int beta, int qply = 0) {
+    if (g_stop_requested.load (std::memory_order_relaxed)) return 0;
     //  Hard Safety Ceiling to prevent infinite search loops
     if (qply >= MAX_QUIESCENCE_PLY)
         return evaluate (board);
@@ -279,6 +290,9 @@ void new_game_reset () {
 }
 
 int alphabeta (chess::Board& board, int depth, int alpha, int beta, int ply) {
+    if (g_stop_requested.load (std::memory_order_relaxed)) return 0; // value unused - caller discards this whole depth
+
+
     uint64_t    hash = board.hash ();
     chess::Move tt_move = chess::Move::NO_MOVE;
     int         tt_score = 0;
@@ -420,4 +434,143 @@ std::pair<chess::Move, int> get_best_move (chess::Board& board, int depth) {
         }
     }
     return { best_move, best_score };
+}
+
+struct RootMoveResult {
+    chess::Move move;
+    int score;
+};
+
+// search_root replaces get_best_move - same root loop, but keeps every
+// move's score instead of only the best one, then returns the top
+// g_multipv of them, sorted best-first.
+std::vector<RootMoveResult> search_root (chess::Board& board, int depth) {
+    chess::Movelist moves;
+    chess::movegen::legalmoves (moves, board);
+
+    std::vector<RootMoveResult> results;
+    if (moves.empty ()) {
+        results.push_back ({ chess::Move::NO_MOVE, board.inCheck () ? -INF : 0 });
+        return results;
+    }
+
+    for (auto move : moves) {
+        if (g_stop_requested.load (std::memory_order_relaxed)) return results; // incomplete - caller must discard
+
+        board.makeMove (move);
+        int score = -alphabeta (board, depth - 1, -INF, INF, 1);
+        board.unmakeMove (move);
+
+        results.push_back ({ move, score });
+    }
+
+    std::sort (results.begin (), results.end (), [](const RootMoveResult& a, const RootMoveResult& b) {
+        return a.score > b.score;
+        });
+
+    int n = std::min (static_cast<int>(results.size ()), std::max (1, g_multipv));
+    results.resize (n);
+    return results;
+}
+
+// Walks the TT forward from `first_move` to reconstruct the rest of the
+// line. Takes `board` BY VALUE deliberately - this mutates its own copy
+// freely without needing to unmake anything or touch the caller's board.
+std::vector<chess::Move> extract_pv (chess::Board board, chess::Move first_move, int max_len) {
+    std::vector<chess::Move> pv;
+    if (first_move == chess::Move::NO_MOVE) return pv;
+
+    pv.push_back (first_move);
+    board.makeMove (first_move);
+    std::vector<uint64_t> seen{ board.hash () };
+
+    for (int i = 1; i < max_len; i++) {
+        chess::Move tt_move = TT.probe_move (board.hash ());
+        if (tt_move == chess::Move::NO_MOVE) break;
+
+        chess::Movelist legal;
+        chess::movegen::legalmoves (legal, board);
+        bool is_legal = false;
+        for (auto& m : legal) { if (m == tt_move) { is_legal = true; break; } }
+        if (!is_legal) break; // stale/collided TT entry - don't trust it
+
+        board.makeMove (tt_move);
+        uint64_t h = board.hash ();
+        if (std::find (seen.begin (), seen.end (), h) != seen.end ()) break; // cycle guard
+        seen.push_back (h);
+        pv.push_back (tt_move);
+    }
+    return pv;
+}
+
+bool is_mate_score (int score) {
+    constexpr int MATE_THRESHOLD = INF - 1000; // real evals never get remotely close to this
+    return std::abs (score) >= MATE_THRESHOLD;
+}
+
+int mate_distance (int score) {
+    int plies_to_mate = INF - std::abs (score);
+    int moves = (plies_to_mate + 1) / 2; // integer ceil-division
+    return score > 0 ? moves : -moves;
+}
+
+void print_multipv_info (chess::Board board, int depth, const std::vector<RootMoveResult>& results, long long time_ms) {
+    for (size_t i = 0; i < results.size (); i++) {
+        const auto& r = results[i];
+        std::cout << "info depth " << depth << " multipv " << (i + 1);
+
+        if (r.move == chess::Move::NO_MOVE) {
+            std::cout << " score " << (is_mate_score (r.score) ? "mate 0" : ("cp " + std::to_string (r.score)));
+            std::cout << "\n";
+            continue; // no position to extract a PV from - game already over here
+        }
+
+        if (is_mate_score (r.score)) {
+            std::cout << " score mate " << mate_distance (r.score);
+        }
+        else {
+            std::cout << " score cp " << r.score;
+        }
+        std::cout << " time " << time_ms << " pv";
+
+        for (auto& m : extract_pv (board, r.move, 24)) {
+            std::cout << " " << chess::uci::moveToUci (m);
+        }
+        std::cout << "\n";
+    }
+    std::cout.flush ();
+}
+
+// Replaces search_with_time_budget AND the old direct get_best_move call
+// for "go depth N" - both paths now go through here. budget_ms = -1 means
+// "no time limit, search to depth_limit regardless of elapsed time" (the
+// fixed-depth path); a real budget applies the existing prediction-based
+// early-stop heuristic, unchanged from before.
+std::vector<RootMoveResult> run_iterative_search (chess::Board& board, int depth_limit, long budget_ms) {
+    auto t_start = Clock::now ();
+    std::vector<RootMoveResult> last_completed;
+    long long last_iter_ms = 0;
+
+    for (int depth = 1; depth <= depth_limit; depth++) {
+        if (g_stop_requested.load (std::memory_order_relaxed)) break;
+
+        auto t_iter_start = Clock::now ();
+        std::vector<RootMoveResult> results = search_root (board, depth);
+        auto t_iter_end = Clock::now ();
+
+        if (g_stop_requested.load (std::memory_order_relaxed)) break; // this depth is incomplete - discard, keep last_completed
+
+        last_iter_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_iter_end - t_iter_start).count ();
+        long long total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_iter_end - t_start).count ();
+
+        last_completed = results;
+        print_multipv_info (board, depth, results, total_ms);
+
+        if (budget_ms >= 0) {
+            if (total_ms >= budget_ms) break;
+            long long predicted_next_ms = last_iter_ms * 4;
+            if (total_ms + predicted_next_ms > budget_ms) break;
+        }
+    }
+    return last_completed;
 }

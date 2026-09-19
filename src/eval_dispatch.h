@@ -28,6 +28,8 @@ int pst_evaluate (const chess::Board& board);
 extern bool         g_use_nnue;
 extern NNUEWeights  g_nnue_weights;
 extern std::string  g_weights_path;
+extern int g_multipv;
+extern std::atomic<bool> g_stop_requested;
 
 
 // ── Init function ─────────────────────────────────────────────────────────────

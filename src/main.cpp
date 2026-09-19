@@ -5,9 +5,104 @@
 #include <chrono>
 #include <algorithm>
 #include "chess.hpp"
-#include "eval_dispatch.h"  
+#include "eval_dispatch.h"
+#include <thread>
+#include <atomic>
+#include "search.hpp"
+#include <iostream>
+#include <thread>
+
 // chess::Board board;
 std::pair<chess::Move, int> get_best_move (chess::Board& board, int depth);
+std::thread g_search_thread;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GoParams — parsed fields from a "go ..." command
+// ─────────────────────────────────────────────────────────────────────────────
+struct GoParams {
+    bool has_depth = false;
+    int  depth = 0;
+    bool has_movetime = false;
+    long movetime_ms = 0;
+    bool has_time = false;   // wtime/btime present
+    long wtime = 0;
+    long btime = 0;
+    long winc = 0;
+    long binc = 0;
+    int  movestogo = 30;      // cutechess default assumption if absent
+    bool infinite = false;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// search_with_time_budget
+// Iterative deepening: searches depth 1, 2, 3, ... using the existing
+// get_best_move(board, depth), stopping once the time budget is consumed.
+//
+// get_best_move() has no internal abort mechanism, so we can't interrupt a
+// search mid-depth. Instead we predict whether the NEXT depth will fit in
+// the remaining budget using the previous iteration's elapsed time and a
+// branching-factor estimate, and only attempt it if it plausibly fits.
+// This is the standard technique simple engines use before implementing
+// true mid-search time checks.
+// ─────────────────────────────────────────────────────────────────────────────
+constexpr int MAX_ID_DEPTH = 12;   // safety ceiling regardless of time budget
+
+// ─────────────────────────────────────────────────────────────────────────────
+// compute_time_budget
+// Converts wtime/btime/winc/binc/movestogo into a millisecond budget for
+// THIS move, using the side to move's clock.
+// ─────────────────────────────────────────────────────────────────────────────
+long compute_time_budget (const GoParams& g, bool white_to_move) {
+    if (g.has_movetime) return g.movetime_ms;
+
+    if (g.has_time) {
+        long my_time = white_to_move ? g.wtime : g.btime;
+        long my_inc = white_to_move ? g.winc : g.binc;
+
+        // Standard heuristic: time for THIS move = remaining/movestogo + most of the increment.
+        // Subtract a small safety margin to avoid flagging on overhead/IO latency.
+        long budget = (my_time / std::max (1, g.movestogo)) + (long)(my_inc * 0.8);
+        budget -= 50;                              // safety margin
+        budget = std::max (budget, (long)50);        // never go below 50ms
+        budget = std::min (budget, my_time / 2);     // never use more than half remaining clock
+        return budget;
+    }
+
+    // Neither movetime nor wtime/btime given (e.g. manual "go depth N" testing,
+    // or "go infinite" which we treat as a generous fixed budget here since we
+    // don't implement true infinite/ponder search).
+    return 5000;
+}
+
+void run_search_and_report (chess::Board board, GoParams g) {
+    std::vector<RootMoveResult> result;
+    try {
+        if (g.has_depth && !g.has_time && !g.has_movetime) {
+            result = run_iterative_search (board, g.depth, -1);
+        }
+        else {
+            bool white_to_move = (board.sideToMove () == chess::Color::WHITE);
+            long budget_ms = compute_time_budget (g, white_to_move);
+            result = run_iterative_search (board, MAX_ID_DEPTH, budget_ms);
+        }
+    }
+    catch (const std::exception& e) {
+        std::cerr << "[FATAL-AVOIDED] search threw: " << e.what () << "\n";
+    }
+
+    if (result.empty ()) {
+        // Either no legal moves at all, or stopped before depth 1 even
+        // finished - same fallback philosophy as the old exception path,
+        // so the engine always produces a valid bestmove.
+        chess::Movelist fallback;
+        chess::movegen::legalmoves (fallback, board);
+        if (!fallback.empty ()) result.push_back ({ fallback[0], 0 });
+    }
+
+    chess::Move best = result.empty () ? chess::Move::NO_MOVE : result[0].move;
+    std::cout << "bestmove " << chess::uci::moveToUci (best) << std::endl;
+}
+
 
 void new_game_reset ();
 using Clock = std::chrono::steady_clock;
@@ -115,22 +210,7 @@ void handle_position (chess::Board& board, const std::string& line) {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// GoParams — parsed fields from a "go ..." command
-// ─────────────────────────────────────────────────────────────────────────────
-struct GoParams {
-    bool has_depth = false;
-    int  depth = 0;
-    bool has_movetime = false;
-    long movetime_ms = 0;
-    bool has_time = false;   // wtime/btime present
-    long wtime = 0;
-    long btime = 0;
-    long winc = 0;
-    long binc = 0;
-    int  movestogo = 30;      // cutechess default assumption if absent
-    bool infinite = false;
-};
+
 
 GoParams parse_go (const std::string& line) {
     GoParams g;
@@ -152,19 +232,6 @@ GoParams parse_go (const std::string& line) {
     return g;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// search_with_time_budget
-// Iterative deepening: searches depth 1, 2, 3, ... using the existing
-// get_best_move(board, depth), stopping once the time budget is consumed.
-//
-// get_best_move() has no internal abort mechanism, so we can't interrupt a
-// search mid-depth. Instead we predict whether the NEXT depth will fit in
-// the remaining budget using the previous iteration's elapsed time and a
-// branching-factor estimate, and only attempt it if it plausibly fits.
-// This is the standard technique simple engines use before implementing
-// true mid-search time checks.
-// ─────────────────────────────────────────────────────────────────────────────
-constexpr int MAX_ID_DEPTH = 12;   // safety ceiling regardless of time budget
 
 std::pair<chess::Move, int> search_with_time_budget (chess::Board& board, long budget_ms) {
     auto t_start = Clock::now ();
@@ -198,33 +265,6 @@ std::pair<chess::Move, int> search_with_time_budget (chess::Board& board, long b
     return { best_move, best_score };
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// compute_time_budget
-// Converts wtime/btime/winc/binc/movestogo into a millisecond budget for
-// THIS move, using the side to move's clock.
-// ─────────────────────────────────────────────────────────────────────────────
-long compute_time_budget (const GoParams& g, bool white_to_move) {
-    if (g.has_movetime) return g.movetime_ms;
-
-    if (g.has_time) {
-        long my_time = white_to_move ? g.wtime : g.btime;
-        long my_inc = white_to_move ? g.winc : g.binc;
-
-        // Standard heuristic: time for THIS move = remaining/movestogo + most of the increment.
-        // Subtract a small safety margin to avoid flagging on overhead/IO latency.
-        long budget = (my_time / std::max (1, g.movestogo)) + (long)(my_inc * 0.8);
-        budget -= 50;                              // safety margin
-        budget = std::max (budget, (long)50);        // never go below 50ms
-        budget = std::min (budget, my_time / 2);     // never use more than half remaining clock
-        return budget;
-    }
-
-    // Neither movetime nor wtime/btime given (e.g. manual "go depth N" testing,
-    // or "go infinite" which we treat as a generous fixed budget here since we
-    // don't implement true infinite/ponder search).
-    return 5000;
-}
-
 
 int main (int argc, char* argv[]) {
     parse_args (argc, argv);
@@ -249,63 +289,20 @@ int main (int argc, char* argv[]) {
         else if (line == "ucinewgame") {
             // Reset search state between games so stale TT/killer data from
             // a finished game doesn't influence the next one.
+            if (g_search_thread.joinable ()) g_search_thread.join ();
             new_game_reset ();
             board = chess::Board ();
-        }
-        else if (line.rfind ("setoption name ", 0) == 0) {
-            size_t name_start = 15;
-            size_t value_pos = line.find (" value ", name_start);
-            if (value_pos != std::string::npos) {
-                std::string opt_name = line.substr (name_start, value_pos - name_start);
-                std::string opt_value = line.substr (value_pos + 7);
-
-                if (opt_name == "EvalMode") {
-                    if (opt_value == "NNUE") { if (!g_use_nnue) init_nnue (g_weights_path); }
-                    else { g_use_nnue = false; }
-                }
-                else if (opt_name == "WeightsPath") {
-                    g_weights_path = opt_value;
-                    if (g_use_nnue) init_nnue (g_weights_path);
-                }
-            }
         }
         else if (line.rfind ("position", 0) == 0) {
             handle_position (board, line);
         }
         else if (line.rfind ("go", 0) == 0) {
-            {
-                GoParams g = parse_go (line);
-
-                std::pair<chess::Move, int> result = { chess::Move::NO_MOVE, 0 };
-
-                try {
-                    if (g.has_depth && !g.has_time && !g.has_movetime) {
-                        // Fixed-depth search — used for manual testing
-                        // (e.g. echo "go depth 6" | engine.exe) and kept for convenience.
-                        result = get_best_move (board, g.depth);
-                    }
-                    else {
-                        bool white_to_move = (board.sideToMove () == chess::Color::WHITE);
-                        long budget_ms = compute_time_budget (g, white_to_move);
-                        result = search_with_time_budget (board, budget_ms);
-                    }
-                }
-                catch (const std::exception& e) {
-                    // A crash anywhere in search/eval must never take down the
-                    // whole process — that forfeits the entire match, not just
-                    // one game. Log the exception and fall back to the first
-                    // legal move so the engine still produces a valid bestmove.
-                    std::cerr << "[FATAL-AVOIDED] search threw: " << e.what () << "\n";
-                    chess::Movelist fallback_moves;
-                    chess::movegen::legalmoves (fallback_moves, board);
-                    if (!fallback_moves.empty ())
-                        result = { fallback_moves[0], 0 };
-                }
-                auto [move, score] = result;
-                std::cout << "info score cp " << score
-                    << " string eval=" << (g_use_nnue ? "NNUE" : "PST") << "\n";
-                std::cout << "bestmove " << chess::uci::moveToUci (move) << std::endl;
-            }
+            if (g_search_thread.joinable ()) g_search_thread.join ();
+            g_stop_requested = false;
+            GoParams g = parse_go (line);
+            g_search_thread = std::thread ([board, g]() mutable {
+                run_search_and_report (board, g);
+                });
         }
         else if (line.rfind ("setoption name ", 0) == 0) {
             size_t name_start = 15;                          // length of "setoption name "
@@ -343,6 +340,16 @@ int main (int argc, char* argv[]) {
                             << "' (expected 'nnue' or 'pst') — ignoring.\n";
                     }
                 }
+                else if (option_name == "MultiPV") {
+                    try {
+                        int v = std::stoi (option_value);
+                        g_multipv = std::max (1, v);
+                        std::cerr << "[MultiPV] Set to " << g_multipv << "\n";
+                    }
+                    catch (const std::exception&) {
+                        std::cerr << "[MultiPV] Invalid value '" << option_value << "' - ignoring.\n";
+                    }
+                }
                 else if (option_name == "WeightsPath") {
                     g_weights_path = option_value;
                     std::cerr << "[WeightsPath] Set to: " << g_weights_path << "\n";
@@ -374,11 +381,12 @@ int main (int argc, char* argv[]) {
                 << " string eval=" << (g_use_nnue ? "NNUE" : "PST") << std::endl;
         }
         else if (line == "stop") {
-
-            // We don't support async/pondering search, so by the time "stop"
-            // arrives we've already returned a bestmove. Safe to ignore.
+            g_stop_requested = true;
+            if (g_search_thread.joinable ()) g_search_thread.join ();
         }
         else if (line == "quit") {
+            g_stop_requested = true;
+            if (g_search_thread.joinable ()) g_search_thread.join ();
             break;
         }
     }

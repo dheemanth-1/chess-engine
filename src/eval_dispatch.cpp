@@ -6,12 +6,14 @@
 
 #include "eval_dispatch.h"
 #include <iostream>
-
+#include <atomic>
 
 // ── Global state ──────────────────────────────────────────────────────────────
 bool        g_use_nnue = false;
 NNUEWeights g_nnue_weights;
 std::string g_weights_path = "nnue_weights.bin";
+int g_multipv = 1;
+std::atomic<bool> g_stop_requested{ false };
 
 bool init_nnue (const std::string& path) {
     if (!load_nnue_weights (path, g_nnue_weights)) {

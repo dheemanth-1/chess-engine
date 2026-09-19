@@ -11,6 +11,14 @@ namespace SearchConstants {
     const int MATE = 900000;
 }
 
+
+struct RootMoveResult {
+    chess::Move move;
+    int score;
+};
+
+std::vector<RootMoveResult> run_iterative_search (chess::Board& board, int depth_limit, long budget_ms);
+
 /**
  * Searches the move tree using Alpha-Beta pruning to find the best move.
  * @param board The current chess board state.
